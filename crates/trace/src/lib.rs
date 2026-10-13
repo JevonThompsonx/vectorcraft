@@ -430,6 +430,14 @@ pub fn presets() -> Vec<(&'static str, TraceParams)> {
     PRESET_NAMES.iter().filter_map(|n| Some((*n, preset(n)?))).collect()
 }
 
+/// The enhanced version of built-in preset `name`: the preset with the options the enhanced
+/// presets have built in: Auto Grouping in all of them, Shapes in all but High Fidelity Photo
+/// (and Flat Logo, which has shapes of its own). Gradients stay an option to turn on.
+pub fn enhanced_preset(name: &str) -> Option<TraceParams> {
+    let p = preset(name)?;
+    Some(TraceParams { auto_grouping: true, shapes: !name.eq_ignore_ascii_case("High Fidelity Photo") && p.mode != Mode::Logo, ..p })
+}
+
 /// One traced shape: an outer contour plus its holes, filled with `color`, or (with `stroke`)
 /// lines stroked with it.
 #[derive(Clone, Debug, PartialEq)]
@@ -813,6 +821,36 @@ impl Layers<'_> {
         shift
     }
 
+    /// Whether the pixels inside `l` (a loop along pixel edges) all have one label.
+    fn one_colour_within(&self, l: &Loop) -> bool {
+        let mut first = None;
+        let (y0, y1) = l.pts.iter().fold((i32::MAX, i32::MIN), |m, p| (m.0.min(p.1), m.1.max(p.1)));
+        for y in y0..y1 {
+            // The loop's upright edges that pass this row of pixels, left to right: the pixels
+            // between the first and the second are inside, and so on.
+            let mut xs: Vec<i32> = l
+                .pts
+                .iter()
+                .zip(l.pts.iter().cycle().skip(1))
+                .filter(|(a, b)| a.0 == b.0 && a.1.min(b.1) <= y && y < a.1.max(b.1))
+                .map(|(a, _)| a.0)
+                .collect();
+            xs.sort_unstable();
+            for pair in xs.as_chunks::<2>().0 {
+                for x in pair[0]..pair[1] {
+                    let label = usize::try_from(y)
+                        .ok()
+                        .zip(usize::try_from(x).ok())
+                        .and_then(|(y, x)| self.q.labels.get(y * self.w + x).copied().filter(|_| x < self.w));
+                    if label.is_none() || *first.get_or_insert(label) != label {
+                        return false;
+                    }
+                }
+            }
+        }
+        first.is_some()
+    }
+
     /// The paths of layer `r` (palette entry `ci`), or `None` once the anchors made pass the
     /// maximum.
     fn layer(&self, r: usize, ci: usize) -> Option<Vec<TracedPath>> {
@@ -882,7 +920,29 @@ impl Layers<'_> {
                 if hole.area2.abs() / 2 < min_hole && params.noise > 0 {
                     continue;
                 }
-                subs.extend(fit(hole));
+                let Some(mut sp) = fit(hole) else { continue };
+                // Shapes: a hole that is a shape is that shape, as what fills it is (the two are
+                // one outline: they stay one). Only where one colour fills it: the parts of
+                // several are not that shape, and would no longer meet it.
+                if params.shapes
+                    && area_stroke.is_none()
+                    && self.one_colour_within(hole)
+                    && let Some(exact) = shapes::recognise(&sp, hard.get()).and_then(|shape| shape.path().subpaths.into_iter().next())
+                {
+                    // (Which way round each goes: by the area of the polygon through points along it.)
+                    let turn = |sp: &vectorcraft_geom::SubPath| {
+                        use vectorcraft_geom::ParamCurve;
+                        let pts: Vec<_> =
+                            (0..sp.segment_count()).flat_map(|i| (0..6).map(move |k| sp.segment(i).eval(f64::from(k) / 6.0).to_vec2())).collect();
+                        pts.iter().zip(pts.iter().cycle().skip(1)).map(|(a, b)| a.cross(*b)).sum::<f64>()
+                    };
+                    let mut exact = exact;
+                    if (turn(&exact) < 0.0) != (turn(&sp) < 0.0) {
+                        exact.reverse();
+                    }
+                    sp = exact;
+                }
+                subs.push(sp);
             }
             // Shapes: a filled outline without holes that is a shape becomes that shape.
             let shape = match subs.as_slice() {

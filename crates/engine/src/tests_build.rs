@@ -773,6 +773,27 @@ fn image_trace_gradients_fills_with_a_gradient() {
     assert!(flat.len() > 1 && flat.iter().all(|n| matches!(n.appearance.fill_paint(), Paint::Solid { .. })));
 }
 
+/// A preset's enhanced version: the preset with Auto Grouping and Shapes, under the preset's name.
+#[test]
+fn image_trace_enhanced_presets() {
+    let mut s = session();
+    image_doc(&mut s);
+    let r = s.execute("imageTrace.make", &json!({"preset": "6 Colors", "enhanced": true})).unwrap();
+    let n = node(&s, NodeId(r["id"].as_u64().unwrap()));
+    let stored = n.extras().trace.clone().unwrap();
+    assert_eq!(stored["preset"], "6 Colors");
+    assert_eq!((stored["params"]["shapes"].as_bool(), stored["params"]["autoGrouping"].as_bool()), (Some(true), Some(true)));
+    // The disc of the test image is a live ellipse, in a group with nothing (it has nothing inside).
+    let shapes: Vec<_> = traced_paths(&n).into_iter().filter(|c| matches!(&c.kind, NodeKind::Path { live: Some(_), .. })).collect();
+    assert_eq!(shapes.len(), 1);
+    // Listed with each preset; the legacy preset is as it was.
+    let list = s.execute("imageTrace.presets", &json!({})).unwrap();
+    let six = list["presets"].as_array().unwrap().iter().find(|p| p["name"] == "6 Colors").unwrap().clone();
+    assert_eq!((six["params"]["shapes"].as_bool(), six["enhanced"]["shapes"].as_bool()), (Some(false), Some(true)));
+    assert_eq!(list["presets"].as_array().unwrap().iter().find(|p| p["name"] == "High Fidelity Photo").unwrap()["enhanced"]["shapes"], false);
+    assert!(s.execute("imageTrace.make", &json!({"preset": "No Such", "enhanced": true})).is_err());
+}
+
 #[test]
 fn image_trace_release_and_expand() {
     let mut s = session();
