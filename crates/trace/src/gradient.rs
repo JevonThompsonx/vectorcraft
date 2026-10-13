@@ -25,10 +25,14 @@ const MAX_STOPS: usize = 6;
 const MIN_SPACING: f64 = 0.08;
 /// How far (levels) the stops may be from the colours along the gradient.
 const STOP_TOLERANCE: f64 = 2.0;
+/// How far (levels) a pixel beside a gradient may be from the gradient's colour there and join it.
+const GROW: f64 = 10.0;
 
-/// A linear gradient a traced path is filled with.
+/// A gradient a traced path is filled with: linear, or radial (the same colour all round a point).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TracedGradient {
+    /// Radial: `start` is the middle, and the stops go outwards to the circle through `end`.
+    pub radial: bool,
     /// The gradient's line, in pixel coordinates: the first stop's colour is at `start` and before
     /// it, the last one's at `end` and beyond.
     pub start: Point,
@@ -38,10 +42,20 @@ pub struct TracedGradient {
 }
 
 impl TracedGradient {
+    /// How far along the gradient `p` is: 0 at `start`, 1 at `end` (or on the circle through it).
+    fn along(&self, p: Point) -> f64 {
+        let d = self.end - self.start;
+        if d.hypot2() <= 0.0 {
+            0.0
+        } else if self.radial {
+            (p - self.start).hypot() / d.hypot()
+        } else {
+            (p - self.start).dot(d) / d.hypot2()
+        }
+    }
     /// The gradient's colour at `p`.
     pub fn color_at(&self, p: Point) -> [f64; 3] {
-        let d = self.end - self.start;
-        let t = if d.hypot2() > 0.0 { ((p - self.start).dot(d) / d.hypot2()).clamp(0.0, 1.0) } else { 0.0 };
+        let t = self.along(p).clamp(0.0, 1.0);
         let color = |i: usize| self.stops.get(i).map_or([0.0; 3], |s| s.1.map(f64::from));
         let after = self.stops.iter().position(|s| s.0 >= t).unwrap_or(self.stops.len().saturating_sub(1));
         let Some(before) = after.checked_sub(1) else { return color(after) };
@@ -50,6 +64,12 @@ impl TracedGradient {
         let (a, b) = (color(before), color(after));
         [0, 1, 2].map(|c| a[c] + (b[c] - a[c]) * k)
     }
+}
+
+/// The pixels beside pixel `i` of a `w` × `h` image.
+fn beside(i: usize, w: usize, h: usize) -> impl Iterator<Item = usize> {
+    let (x, y) = (i % w, i / w);
+    [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)].into_iter().flatten()
 }
 
 /// The gradients of `img`: for each pixel the gradient it is part of (an index into the list, or
@@ -103,11 +123,8 @@ pub(crate) fn detect(img: &Raster) -> (Vec<u32>, Vec<TracedGradient>) {
     let mut depth = vec![0u16; w * h];
     let mut found = vec![];
     let (mut members, mut stack) = (vec![], vec![]);
-    for seed in 0..w * h {
-        if seen.get(seed).copied().unwrap_or(true) || !smooth.get(seed).copied().unwrap_or(false) {
-            continue;
-        }
-        // The connected smooth pixels from here.
+    // The connected smooth pixels from `seed` that `seen` has not: into `members`.
+    let mut flood = |seed: usize, seen: &mut [bool], members: &mut Vec<usize>| {
         members.clear();
         stack.push(seed);
         if let Some(s) = seen.get_mut(seed) {
@@ -115,8 +132,7 @@ pub(crate) fn detect(img: &Raster) -> (Vec<u32>, Vec<TracedGradient>) {
         }
         while let Some(i) = stack.pop() {
             members.push(i);
-            let (x, y) = (i % w, i / w);
-            for j in [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)].into_iter().flatten() {
+            for j in beside(i, w, h) {
                 if smooth.get(j).copied().unwrap_or(false) && !seen.get(j).copied().unwrap_or(true) {
                     if let Some(s) = seen.get_mut(j) {
                         *s = true;
@@ -125,7 +141,26 @@ pub(crate) fn detect(img: &Raster) -> (Vec<u32>, Vec<TracedGradient>) {
                 }
             }
         }
-        if members.len() < MIN_PIXELS || found.len() >= 1000 {
+    };
+    // The areas, largest first: a gradient that noise or a soft rim broke into several is found in
+    // its largest piece and grown over the rest.
+    let mut areas: Vec<(usize, usize)> = vec![];
+    for seed in 0..w * h {
+        if !seen.get(seed).copied().unwrap_or(true) && smooth.get(seed).copied().unwrap_or(false) {
+            flood(seed, &mut seen, &mut members);
+            if members.len() >= MIN_PIXELS {
+                areas.push((members.len(), seed));
+            }
+        }
+    }
+    areas.sort_unstable_by(|a, b| b.cmp(a));
+    seen.fill(false);
+    for (_, seed) in areas {
+        if seen.get(seed).copied().unwrap_or(true) || found.len() >= 1000 {
+            continue;
+        }
+        flood(seed, &mut seen, &mut members);
+        if members.len() < MIN_PIXELS {
             continue;
         }
         // The gradient is read from the area's inside, where there is one: the pixels at its rim
@@ -135,16 +170,12 @@ pub(crate) fn detect(img: &Raster) -> (Vec<u32>, Vec<TracedGradient>) {
         let rim = far as usize + 2;
         let unknown = u16::MAX;
         members.iter().for_each(|&i| depth[i] = unknown);
-        let beside = |i: usize| {
-            let (x, y) = (i % w, i / w);
-            [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)].into_iter().flatten()
-        };
-        let mut front: Vec<usize> = members.iter().copied().filter(|&i| beside(i).any(|j| depth.get(j).copied() == Some(0))).collect();
+        let mut front: Vec<usize> = members.iter().copied().filter(|&i| beside(i, w, h).any(|j| depth.get(j).copied() == Some(0))).collect();
         front.iter().for_each(|&i| depth[i] = 1);
         for d in 2..=rim as u16 {
             let mut next = vec![];
             for &i in &front {
-                for j in beside(i) {
+                for j in beside(i, w, h) {
                     if let Some(slot) = depth.get_mut(j).filter(|s| **s == unknown) {
                         *slot = d;
                         next.push(j);
@@ -156,10 +187,25 @@ pub(crate) fn detect(img: &Raster) -> (Vec<u32>, Vec<TracedGradient>) {
         let inside: Vec<usize> = members.iter().copied().filter(|&i| depth.get(i).copied() == Some(unknown)).collect();
         let fitted = fit(img, w, if inside.len() >= MIN_PIXELS { &inside } else { &members }, &members, rim);
         members.iter().for_each(|&i| depth[i] = 0);
-        if let Some((g, part)) = fitted {
+        if let Some((g, mut part)) = fitted {
             for &i in &part {
                 if let Some(o) = of.get_mut(i) {
                     *o = found.len() as u32;
+                }
+            }
+            // Grown over every pixel next to it that has its colour there: the pixels noise put a
+            // little off, a soft rim, the pieces noise cut off it.
+            while let Some(i) = part.pop() {
+                for j in beside(i, w, h) {
+                    let near = px(j).is_some_and(|c| {
+                        let own = g.color_at(Point::new((j % w) as f64 + 0.5, (j / w) as f64 + 0.5));
+                        (0..3).all(|k| (f64::from(c[k]) - own[k]).abs() <= GROW)
+                    });
+                    if near && of.get(j).copied() == Some(u32::MAX) {
+                        of[j] = found.len() as u32;
+                        seen[j] = true;
+                        part.push(j);
+                    }
                 }
             }
             found.push(g);
@@ -168,7 +214,7 @@ pub(crate) fn detect(img: &Raster) -> (Vec<u32>, Vec<TracedGradient>) {
     (of, found)
 }
 
-/// The linear gradient the pixels `members` of `img` (`w` wide) are, if they are one, and those of
+/// The gradient (linear, else radial) the pixels `members` of `img` (`w` wide) are, if they are one, and those of
 /// `all` (the whole area `members` are the inside of, `rim` pixels in) that have its colours.
 fn fit(img: &Raster, w: usize, members: &[usize], all: &[usize], rim: usize) -> Option<(TracedGradient, Vec<usize>)> {
     let n = members.len() as f64;
@@ -206,14 +252,101 @@ fn fit(img: &Raster, w: usize, members: &[usize], all: &[usize], rim: usize) -> 
     let (mxx, mxy, myy) = slope.iter().fold((0.0, 0.0, 0.0), |m, s| (m.0 + s.x * s.x, m.1 + s.x * s.y, m.2 + s.y * s.y));
     let spread = ((mxx - myy) / 2.0).hypot(mxy);
     let (major, minor) = ((mxx + myy) / 2.0 + spread, (mxx + myy) / 2.0 - spread);
-    if major <= 0.0 || minor > 0.03 * major {
-        return None;
-    }
     let angle = 0.5 * (2.0 * mxy).atan2(mxx - myy);
-    let dir = Vec2::new(angle.cos(), angle.sin());
+    let line = (major > 0.0 && minor <= 0.03 * major)
+        .then(|| ramp(img, w, members, all, rim, Axis::Line(middle, Vec2::new(angle.cos(), angle.sin()))))
+        .flatten();
+    // Not along one direction: round a point, perhaps.
+    line.or_else(|| ramp(img, w, members, all, rim, Axis::Round(middle_of_rings(img, w, members)?)))
+}
+
+/// What a gradient's colours go along: a line through a point, or outwards from a point.
+#[derive(Clone, Copy)]
+enum Axis {
+    Line(Point, Vec2),
+    Round(Point),
+}
+
+impl Axis {
+    /// How far (px) along it `p` is.
+    fn along(self, p: Point) -> f64 {
+        match self {
+            Axis::Line(through, dir) => (p - through).dot(dir),
+            Axis::Round(middle) => (p - middle).hypot(),
+        }
+    }
+    /// The point `t` px along it.
+    fn at(self, t: f64) -> Point {
+        match self {
+            Axis::Line(through, dir) => through + dir * t,
+            Axis::Round(middle) => middle + Vec2::new(t, 0.0),
+        }
+    }
+}
+
+/// The middle of the pixels `members` if their colour goes round a point: the common middle of the
+/// circles that the pixels of one tone lie on, for three tones.
+fn middle_of_rings(img: &Raster, w: usize, members: &[usize]) -> Option<Point> {
+    let rgb = |i: usize| img.rgba.get(i * 4..i * 4 + 3).map_or([0u8; 3], |p| [p[0], p[1], p[2]]);
+    // By the channel that changes most.
+    let (low, high) =
+        members.iter().fold(([255u8; 3], [0u8; 3]), |m, &i| ([0, 1, 2].map(|k| m.0[k].min(rgb(i)[k])), [0, 1, 2].map(|k| m.1[k].max(rgb(i)[k]))));
+    let channel = (0..3).max_by_key(|&k| high[k].saturating_sub(low[k]))?;
+    let mut count = [0usize; 256];
+    members.iter().for_each(|&i| count[rgb(i)[channel] as usize] += 1);
+    let tone_at = |share: f64| {
+        let mut seen = 0;
+        count.iter().position(|&n| {
+            seen += n;
+            seen as f64 >= share * members.len() as f64
+        })
+    };
+    let mut middles = vec![];
+    for share in [0.3, 0.5, 0.7] {
+        let tone = tone_at(share)? as i32;
+        // The circle x² + y² + d x + e y + f = 0 nearest the pixels of that tone, by least squares.
+        let (mut m, mut v) = ([[0.0f64; 3]; 3], [0.0f64; 3]);
+        let mut n = 0;
+        for &i in members.iter().filter(|&&i| (i32::from(rgb(i)[channel]) - tone).abs() <= 1) {
+            let (x, y) = ((i % w) as f64 + 0.5, (i / w) as f64 + 0.5);
+            let (row, z) = ([x, y, 1.0], -(x * x + y * y));
+            for a in 0..3 {
+                for b in 0..3 {
+                    m[a][b] += row[a] * row[b];
+                }
+                v[a] += row[a] * z;
+            }
+            n += 1;
+        }
+        let det = |m: &[[f64; 3]; 3]| {
+            m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+        };
+        let whole = det(&m);
+        if n < 30 || whole.abs() < 1e-6 {
+            return None;
+        }
+        let solved = |col: usize| {
+            let mut swapped = m;
+            (0..3).for_each(|r| swapped[r][col] = v[r]);
+            det(&swapped) / whole
+        };
+        middles.push(Point::new(-solved(0) / 2.0, -solved(1) / 2.0));
+    }
+    let mean = (middles.iter().fold(Vec2::ZERO, |s, p| s + p.to_vec2()) / middles.len() as f64).to_point();
+    (mean.x.is_finite() && mean.y.is_finite() && middles.iter().all(|p| p.distance(mean) <= 3.0)).then_some(mean)
+}
+
+/// The gradient the pixels `members` are along `axis`, if they are one (see [`fit`]).
+fn ramp(img: &Raster, w: usize, members: &[usize], all: &[usize], rim: usize, axis: Axis) -> Option<(TracedGradient, Vec<usize>)> {
+    let at = |i: usize| Point::new((i % w) as f64 + 0.5, (i / w) as f64 + 0.5);
+    let rgb = |i: usize| img.rgba.get(i * 4..i * 4 + 3).map_or([0.0; 3], |p| [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])]);
+    let radial = matches!(axis, Axis::Round(_));
     // The colours along it, a pixel's width at a time.
-    let along = |i: usize| (at(i) - middle).dot(dir);
+    let along = |i: usize| axis.along(at(i));
     let (t0, t1) = members.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |m, &i| (m.0.min(along(i) - 0.5), m.1.max(along(i) + 0.5)));
+    // (A radial gradient starts at its middle, whether or not the area reaches it.)
+    let t0 = if radial { 0.0 } else { t0 };
     let length = t1 - t0;
     if !(MIN_LENGTH..1e6).contains(&length) {
         return None;
@@ -272,7 +405,7 @@ fn fit(img: &Raster, w: usize, members: &[usize], all: &[usize], rim: usize) -> 
             _ => stops.push((t, c)),
         }
     }
-    let (first, last) = (stops.first()?.0, stops.last()?.0);
+    let (first, last) = (if radial { 0.0 } else { stops.first()?.0 }, stops.last()?.0);
     // A change of colour, not one colour.
     let change =
         stops.iter().flat_map(|a| stops.iter().map(move |b| (0..3).map(|k| (a.1[k] - b.1[k]).abs()).fold(0.0, f64::max))).fold(0.0, f64::max);
@@ -282,13 +415,19 @@ fn fit(img: &Raster, w: usize, members: &[usize], all: &[usize], rim: usize) -> 
         return None;
     }
     let gradient = TracedGradient {
-        start: middle + dir * (t0 + first * length),
-        end: middle + dir * (t0 + last * length),
-        stops: stops.iter().map(|&(t, c)| ((t - first) / (last - first), c.map(|v| v.round().clamp(0.0, 255.0) as u8))).collect(),
+        radial,
+        start: axis.at(t0 + first * length),
+        end: axis.at(t0 + last * length),
+        // (A radial one's first colour goes on to its middle.)
+        stops: stops
+            .iter()
+            .enumerate()
+            .map(|(j, &(t, c))| (if j == 0 { 0.0 } else { (t - first) / (last - first) }, c.map(|v| v.round().clamp(0.0, 255.0) as u8)))
+            .collect(),
     };
     // Carried on to the ends of the whole area, each end ramp going on as it goes.
     let d = gradient.end - gradient.start;
-    let place = |i: usize| (at(i) - gradient.start).dot(d) / d.hypot2();
+    let place = |i: usize| gradient.along(at(i));
     let reach = rim as f64 * 1.5 / d.hypot();
     let (u0, u1) = all.iter().fold((0.0f64, 1.0f64), |m, &i| (m.0.min(place(i)), m.1.max(place(i))));
     let (u0, u1) = (u0.max(-reach), u1.min(1.0 + reach));
@@ -305,6 +444,7 @@ fn fit(img: &Raster, w: usize, members: &[usize], all: &[usize], rim: usize) -> 
         }
     }
     let gradient = TracedGradient {
+        radial,
         start: gradient.start + d * u0,
         end: gradient.start + d * u1,
         stops: stops.into_iter().map(|(u, c)| ((u - u0) / (u1 - u0), c)).collect(),
@@ -421,6 +561,21 @@ mod tests {
         assert!(detect(&soft).1.is_empty());
         // Red changing across and green changing down.
         assert!(detect(&ramp(96, 96, |x, y| [40.0 + 2.0 * x, 40.0 + 2.0 * y, 90.0])).1.is_empty());
+    }
+
+    #[test]
+    fn colours_going_round_a_point_are_a_radial_gradient() {
+        // Yellow at (70, 50) to dark red 80 px out.
+        let img = ramp(160, 120, |x, y| {
+            let t = ((x - 70.0).hypot(y - 50.0) / 80.0).min(1.0);
+            [250.0 - 130.0 * t, 220.0 - 190.0 * t, 60.0 - 30.0 * t]
+        });
+        let (_, found) = detect(&img);
+        let g = found.iter().find(|g| g.radial).expect("a radial gradient");
+        assert!(g.start.distance(Point::new(70.0, 50.0)) < 1.0, "{:?}", g.start);
+        assert!(((g.end - g.start).hypot() - 80.0).abs() < 5.0, "{:?}", g);
+        let (first, last) = (g.stops[0].1, g.stops.last().unwrap().1);
+        assert!(first[0] > 240 && first[1] > 205 && last[0] < 135 && last[1] < 45, "{:?}", g.stops);
     }
 
     #[test]
