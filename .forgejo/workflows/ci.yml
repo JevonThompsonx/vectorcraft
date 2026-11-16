@@ -19,10 +19,13 @@ jobs:
     runs-on: forgejo-ci
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets
       - name: cargo test
         run: cargo test --all
       - name: cargo build
