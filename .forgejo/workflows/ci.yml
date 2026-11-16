@@ -6,8 +6,8 @@ on:
   pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: read
+# NOTE: no top-level `permissions:` block. Forgejo does not implement it and
+# warns "has a permissions field which is not supported ... and will be ignored".
 
 concurrency:
   group: ci-${{ forgejo.ref }}
@@ -19,14 +19,16 @@ jobs:
     runs-on: forgejo-ci
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      - name: Rust toolchain
+        run: |
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
+            --component rustfmt --component clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: cargo fmt
-        run: cargo fmt --all -- --check
+        run: export PATH="$HOME/.cargo/bin:$PATH"; cargo fmt --all -- --check
       - name: cargo clippy
-        run: cargo clippy --all-targets
+        run: export PATH="$HOME/.cargo/bin:$PATH"; cargo clippy --all-targets
       - name: cargo test
-        run: cargo test --all
+        run: export PATH="$HOME/.cargo/bin:$PATH"; cargo test --all
       - name: cargo build
-        run: cargo build --locked
+        run: export PATH="$HOME/.cargo/bin:$PATH"; cargo build --locked
