@@ -28,7 +28,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.95"
+          toolchain: "1.100"
       - name: Fetch pinned and checksum-verified corpus
         run: cargo xtask corpus --affinity
       - name: Parse every file and freeze actual Affinity 3 feature retention
