@@ -6,7 +6,7 @@ name: ci
 # multiplies runner load without proving anything new.
 on:
   push:
-    branches: [main, master]
+    branches: [ci-speedup-nightly-platform-checks, main, master]
   workflow_dispatch:
 
 # Forgejo does not implement top-level `permissions:`; including it only
