@@ -22,6 +22,17 @@ jobs:
     runs-on: forgejo-ci
     steps:
       - uses: actions/checkout@v4
+      - name: system deps
+        # GUI/audio crates need headers that the job image does not ship.
+        # A missing entry shows up as a pkg-config error in cargo check, so
+        # this step itself is allowed to be incomplete.
+        run: |
+          set -eu
+          SUDO=""; [ "$(id -u)" = 0 ] || SUDO=sudo
+          $SUDO apt-get update -qq || true
+          $SUDO apt-get install -y -qq pkg-config libssl-dev libasound2-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libxdo-dev \
+            libayatana-appindicator3-dev || true
       - name: Rust toolchain
         run: |
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal \
