@@ -9,7 +9,7 @@ name: security
 # of painting every merge red.
 on:
   push:
-    branches: [main, master]
+    branches: [ci-speedup-nightly-platform-checks, main, master]
   schedule:
     - cron: "0 6 * * 1"
   workflow_dispatch:
